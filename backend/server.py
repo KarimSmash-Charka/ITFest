@@ -26,8 +26,14 @@ if OPENAI_API_KEY and OpenAI is not None:
 
 
 def load_users():
+    """Загружаем пользователей, если файла нет или он битый — возвращаем []"""
+    if not os.path.exists(USER_FILE):
+        return []
     with open(USER_FILE, 'r') as f:
-        return json.load(f)
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return []
 
 def save_users(users):
     with open(USER_FILE, 'w') as f:
@@ -306,12 +312,246 @@ def build_summary_ru(category: str, full_text: str) -> str:
 @app.route('/ask', methods=['POST'])
 def ask():
     """
-    Backward-compatible demo endpoint, simple echo.
+    Многоходовый чат-эндпоинт для вкладки "Диалог".
+    Плюс: при запросе оператора создаёт тикет и возвращает его номер.
+ 
+    Ожидает JSON:
+      {
+        "text": "последнее сообщение пользователя",
+        "history": [
+          {"role": "user"|"assistant", "content": "..."},
+          ...
+        ],
+        "email": "user@example.com"  # опционально, для связи с тикетами
+      }
+    Возвращает JSON: { "reply": "<ответ ИИ>", ...опционально ticket_id... }
     """
     data = request.get_json() or {}
-    user_text = data.get('text', '')
-    reply = f'Hello, {user_text}'
-    return jsonify({'reply': reply})
+    user_text = (data.get('text') or '').strip()
+    history = data.get('history') or []
+    user_email = (data.get('email') or '').strip().lower() or None
+ 
+    # 1) Строим сообщения для ChatGPT с учётом истории
+    system_text = (
+        'Ты — дружелюбный ассистент службы поддержки.\n'
+        'Отвечай коротко, по делу и на русском языке.\n'
+        'Учитывай весь предыдущий контекст диалога, который видишь в истории.\n'
+        'Если ситуация явно требует участия человека, можешь предложить перевод на оператора, '
+        'но не придумывай номер тикета — его добавит система.'
+    )
+ 
+    messages = [
+        {
+            'role': 'system',
+            'content': [{'type': 'text', 'text': system_text}],
+        }
+    ]
+ 
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        role = item.get('role') or 'user'
+        content = item.get('content') or ''
+        if not content:
+            continue
+        if role not in ('user', 'assistant', 'system'):
+            role = 'user'
+        messages.append(
+            {'role': role, 'content': [{'type': 'text', 'text': content}]}
+        )
+ 
+    if user_text:
+        messages.append(
+            {'role': 'user', 'content': [{'type': 'text', 'text': user_text}]}
+        )
+ 
+    # 2) Получаем основной ответ от модели (если доступен)
+    if openai_client is None:
+        ai_reply = f'Эхо: {user_text}'
+    else:
+        try:
+            completion = openai_client.chat.completions.create(
+                model='gpt-4o-mini',
+                messages=messages,
+                temperature=0.4,
+            )
+            ai_reply = completion.choices[0].message.content or ''
+        except Exception as e:
+            print(f'[chat] OpenAI error: {e}', file=sys.stderr)
+            ai_reply = (
+                'Извините, сейчас не получается ответить через модель. '
+                'Попробуйте ещё раз чуть позже.'
+            )
+ 
+    ai_reply = ai_reply.strip()
+ 
+    #
+    # 3) Проверяем, не просит ли пользователь «живого» оператора
+    #
+    lower_text = (user_text or '').lower()
+    handoff_markers = [
+        'оператору',
+        'оператор',
+        'живому человеку',
+        'живой человек',
+        'переведи на оператора',
+        'переведите на оператора',
+        'техподдерж',
+        'тех поддерж',
+        'поддержку человека',
+        'сотрудника поддержки',
+        'тех персоналу',
+        'техперсоналу',
+        'тех персонал',
+        'техническому специалисту',
+        'техническому персоналу',
+        'специалисту поддержки',
+        'службу поддержки',
+        'служба поддержки',
+        'связать с тех персоналом',
+        'свяжи с тех персоналом',
+    ]
+    # Явный запрос оператора в текущем сообщении
+    needs_handoff = any(m in lower_text for m in handoff_markers)
+ 
+    # Дополнительно интерпретируем короткое "Да, пожалуйста" как согласие,
+    # если предыдущий ответ ассистента предлагал перевести на оператора.
+    if not needs_handoff and history:
+        last_assistant_text = ''
+        for item in reversed(history):
+            if isinstance(item, dict) and (item.get('role') or 'user') == 'assistant':
+                last_assistant_text = item.get('content') or ''
+                break
+ 
+        if last_assistant_text:
+            assistant_lower = last_assistant_text.lower()
+            assistant_offer_markers = [
+                'могу передать вашему оператору',
+                'могу передать оператору',
+                'могу перевести на оператора',
+                'перевести на оператора',
+                'передам оператору',
+                'передам в техподдержку',
+                'передам в техническую поддержку',
+                'могу подключить оператора',
+            ]
+            accept_markers = [
+                'да.',
+                'да,',
+                'да пожалуйста',
+                'да. пожалуйста',
+                'да, пожалуйста',
+                'да спасибо',
+                'да, спасибо',
+                'да, переводи',
+                'да переводи',
+                'ok',
+                'ок',
+                'хорошо, переводите',
+                'можно',
+            ]
+ 
+            if any(m in assistant_lower for m in assistant_offer_markers) and any(
+                m in lower_text for m in accept_markers
+            ):
+                needs_handoff = True
+ 
+    ticket_payload = None
+ 
+    if needs_handoff:
+        # Собираем полный текст из всей истории пользователя
+        user_history_parts = []
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            if (item.get('role') or 'user') != 'user':
+                continue
+            part = item.get('content') or ''
+            if part:
+                user_history_parts.append(part)
+ 
+        full_text = '\n'.join(user_history_parts + [user_text]).strip() or user_text
+ 
+        # Классифицируем запрос по тем же правилам, что и при создании тикета из формы
+        language = detect_language(full_text)
+        category = classify_category(full_text)
+        priority = classify_priority(full_text)
+        department, _auto_resolve, _need_human = decide_routing(category, full_text)
+        auto_resolve = False
+        need_human = True
+        summary = build_summary_ru(category, full_text)
+ 
+        tickets = load_tickets()
+        next_numeric_id = (tickets[-1]['_id'] + 1) if tickets else 2000
+        created_at = datetime.utcnow().strftime('%d.%m.%Y, %H:%M')
+ 
+        # Готовим историю диалога для оператора
+        dialog_history = []
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            role = item.get('role') or 'user'
+            content = item.get('content') or ''
+            if not content:
+                continue
+            if role not in ('user', 'assistant'):
+                role = 'user'
+            dialog_history.append({'role': role, 'text': content})
+
+        if user_text:
+            dialog_history.append({'role': 'user', 'text': user_text})
+        if ai_reply:
+            dialog_history.append({'role': 'assistant', 'text': ai_reply})
+
+        ticket_record = {
+            '_id': next_numeric_id,
+            'id': f'#{next_numeric_id}',
+            'source': 'Web',
+            'category': category,
+            'priority': priority,
+            'department': department,
+            'status': 'assigned',
+            'created_at': created_at,
+            'assigned_to': 'Operator',
+            'summary': summary,
+            'language': language,
+            'last_text': user_text,
+            'answer': ai_reply,
+            'auto_resolve': auto_resolve,
+            'need_human': need_human,
+            'user_email': user_email,
+            'history': dialog_history,
+        }
+ 
+        tickets.append(ticket_record)
+        save_tickets(tickets)
+ 
+        ticket_id_label = ticket_record['id']
+ 
+        classification_block = (
+            'Я классифицировал ваше обращение и передам его специалистам для детальной проверки.\n'
+            f'• Категория: {category}.\n'
+            f'• Приоритет: {priority}.\n'
+            f'• Ответственный отдел: {department}.\n'
+            f'Номер вашего тикета: {ticket_id_label}'
+        )
+ 
+        ai_reply = ai_reply + '\n\n' + classification_block
+ 
+        ticket_payload = {
+            'ticket_id': ticket_id_label,
+            'category': category,
+            'priority': priority,
+            'department': department,
+            'auto_resolve': auto_resolve,
+            'need_human': need_human,
+        }
+ 
+    response = {'reply': ai_reply}
+    if ticket_payload is not None:
+        response.update(ticket_payload)
+ 
+    return jsonify(response)
 
 
 @app.route('/tickets', methods=['POST'])
@@ -326,6 +566,7 @@ def route_ticket():
     input_obj = payload.get('input') or {}
 
     text = input_obj.get('text') or ''
+    user_email = (input_obj.get('user_email') or '').strip().lower() or None
     history = input_obj.get('history') or []
 
     history_text = ' '.join(m.get('text', '') for m in history if isinstance(m, dict))
@@ -382,10 +623,16 @@ def route_ticket():
             )
 
             completion = openai_client.chat.completions.create(
-                model='gpt-4.1-mini',
+                model='gpt-4o-mini',
                 messages=[
-                    {'role': 'system', 'content': system_prompt},
-                    {'role': 'user', 'content': user_prompt},
+                    {
+                        'role': 'system',
+                        'content': [{'type': 'text', 'text': system_prompt}],
+                    },
+                    {
+                        'role': 'user',
+                        'content': [{'type': 'text', 'text': user_prompt}],
+                    },
                 ],
                 temperature=0.2,
             )
@@ -427,6 +674,12 @@ def route_ticket():
         'answer': answer,
         'auto_resolve': auto_resolve,
         'need_human': need_human,
+        'user_email': user_email,
+        # простая история диалога для оператора
+        'history': [
+            {'role': 'user', 'text': text},
+            {'role': 'assistant', 'text': answer},
+        ],
     }
 
     tickets.append(ticket_record)
@@ -453,7 +706,32 @@ def list_tickets():
     Lightweight endpoint for operator view.
     """
     tickets = load_tickets()
+
+    # Если передан ?email=..., фильтруем тикеты конкретного пользователя
+    email = (request.args.get('email') or '').strip().lower()
+    if email:
+        tickets = [t for t in tickets if (t.get('user_email') or '').lower() == email]
+
     return jsonify(tickets)
+
+
+@app.route('/tickets/<ticket_id>', methods=['DELETE'])
+def delete_ticket(ticket_id):
+    """
+    Удаление тикета по его ID (строка вида '1234' или '#1234').
+    """
+    tickets = load_tickets()
+    if not tickets:
+        return jsonify({'message': 'Нет тикетов для удаления'}), 404
+
+    normalized = ticket_id if ticket_id.startswith('#') else f'#{ticket_id}'
+
+    new_tickets = [t for t in tickets if t.get('id') != normalized]
+    if len(new_tickets) == len(tickets):
+        return jsonify({'message': 'Тикет не найден', 'ticket_id': normalized}), 404
+
+    save_tickets(new_tickets)
+    return jsonify({'message': 'Тикет удалён', 'ticket_id': normalized}), 200
 
 
 @app.route('/metrics', methods=['GET'])
@@ -482,31 +760,289 @@ def metrics():
 
     return jsonify(response)
 
-@app.route('/register', methods=['GET'])
-def register():
-    data = request.get_json()
-    username = data.get('username')
-    password = data.get('password')
 
-    user = load_users()
-    if any(u['username'] == username for u in user):
-        return jsonify({'message:': 'Пользователь уже занят'}), 409
-    
-    user.append({'username': username, 'password': password})
-    save_users(user)
-    return jsonify({'message': 'Регистрация прошла успешна'}), 201
+@app.route('/translate', methods=['POST'])
+def translate_dialog():
+    """
+    Перевод простого диалога (пользователь + ИИ + summary) на ru/kk.
+
+    Ожидает JSON:
+      {
+        "target_language": "ru" | "kk",
+        "user_text": "...",
+        "ai_answer": "...",
+        "summary": "..."
+      }
+    Возвращает JSON:
+      { "user_text": "...", "ai_answer": "...", "summary": "..." }
+    """
+    data = request.get_json() or {}
+    target_language = (data.get('target_language') or 'ru').strip().lower()
+    if target_language not in ('ru', 'kk'):
+        target_language = 'ru'
+
+    user_text = data.get('user_text') or ''
+    ai_answer = data.get('ai_answer') or ''
+    summary = data.get('summary') or ''
+
+    full_text = '\n'.join(
+        part for part in [str(user_text), str(ai_answer), str(summary)] if part
+    )
+
+    # Если текст пустой — просто вернуть как есть
+    if not full_text.strip():
+        return jsonify(
+            {
+                'user_text': user_text,
+                'ai_answer': ai_answer,
+                'summary': summary,
+            }
+        )
+
+    # Если язык уже совпадает с целевым — ничего не делаем
+    detected = detect_language(full_text)
+    if detected == target_language:
+        return jsonify(
+            {
+                'user_text': user_text,
+                'ai_answer': ai_answer,
+                'summary': summary,
+            }
+        )
+
+    # Если нет рабочего клиента OpenAI — возвращаем исходные тексты
+    if openai_client is None:
+        return jsonify(
+            {
+                'user_text': user_text,
+                'ai_answer': ai_answer,
+                'summary': summary,
+            }
+        )
+
+    if target_language == 'kk':
+        system_prompt = (
+            'Сен аудармашысың.\n'
+            'Барлық берілген мәтіндерді қазақ тіліне аудар. Мағынаны сақта, артық түсіндірме қоспа.\n'
+            'Жауабыңды тек JSON форматында қайтар:\n'
+            '{ "user_text": "...", "ai_answer": "...", "summary": "..." }'
+        )
+    else:
+        system_prompt = (
+            'Ты переводчик.\n'
+            'Переведи все переданные тексты на русский язык. Сохрани смысл, не добавляй пояснений.\n'
+            'Ответ верни строго в JSON-формате:\n'
+            '{ "user_text": "...", "ai_answer": "...", "summary": "..." }'
+        )
+
+    user_prompt = json.dumps(
+        {
+            'user_text': user_text,
+            'ai_answer': ai_answer,
+            'summary': summary,
+        },
+        ensure_ascii=False,
+    )
+
+    translated_user = user_text
+    translated_ai = ai_answer
+    translated_summary = summary
+
+    try:
+        completion = openai_client.chat.completions.create(
+            model='gpt-4o-mini',
+            messages=[
+                {
+                    'role': 'system',
+                    'content': [{'type': 'text', 'text': system_prompt}],
+                },
+                {
+                    'role': 'user',
+                    'content': [{'type': 'text', 'text': user_prompt}],
+                },
+            ],
+            temperature=0.1,
+        )
+        content = completion.choices[0].message.content or ''
+        try:
+            parsed = json.loads(content)
+            translated_user = parsed.get('user_text', translated_user)
+            translated_ai = parsed.get('ai_answer', translated_ai)
+            translated_summary = parsed.get('summary', translated_summary)
+        except Exception:
+            # Если не получилось распарсить JSON — используем исходные тексты
+            pass
+    except Exception as e:
+        print(f'[translate] OpenAI error: {e}', file=sys.stderr)
+
+    return jsonify(
+        {
+            'user_text': translated_user,
+            'ai_answer': translated_ai,
+            'summary': translated_summary,
+        }
+    )
+
+
+@app.route('/summarize', methods=['POST'])
+def summarize_dialog():
+    """
+    Делает краткое, но информативное summary по диалогу (пользователь + ответ ИИ).
+
+    Ожидает JSON:
+      {
+        "user_text": "...",
+        "ai_answer": "...",
+        "summary": "..."   # опционально — существующее краткое summary
+      }
+
+    Возвращает JSON:
+      { "summary": "..." }  # 2–4 предложения с описанием проблемы и статуса
+    """
+    data = request.get_json() or {}
+    user_text = data.get('user_text') or ''
+    ai_answer = data.get('ai_answer') or ''
+    existing_summary = data.get('summary') or ''
+    language = (data.get('language') or 'ru').strip().lower()
+    if language not in ('ru', 'kk'):
+        language = 'ru'
+
+    base_text = (user_text or '').strip()
+    if not base_text and ai_answer:
+        base_text = ai_answer.strip()
+
+    if not base_text:
+        return jsonify({'summary': existing_summary or ''})
+
+    # Если нет клиента OpenAI — fallback на rule-based summary
+    if openai_client is None:
+        rough = build_summary_ru('Другое', base_text)
+        return jsonify({'summary': rough})
+
+    if language == 'kk':
+        system_prompt = (
+            'Сен техникалық қолдау қызметінің ассистентісің.\n'
+            'Саған тикет бойынша қысқа, бірақ мазмұнды summary жасау керек.\n'
+            '2–4 сөйлем жаз:\n'
+            '1) Пайдаланушының негізгі мәселесін қысқаша сипатта.\n'
+            '2) Ағымдағы жағдайды белгіле (не істелді: ИИ немесе пайдаланушы не жасады).\n'
+            '3) Қажет болса, оператор үшін келесі қадамды айт.\n'
+            'Қазақ тілінде, артық «су» қоспай жаз, бірақ оператор толық хат-хабарды оқымай-ақ түсінетіндей болуы керек.'
+        )
+
+        user_prompt = (
+            'Пайдаланушының мәтіні:\n'
+            f'{user_text or "—"}\n\n'
+            'ИИ жауабы (бар болса):\n'
+            f'{ai_answer or "—"}\n\n'
+            'Жоғарыдағы ережелер бойынша summary жаз.'
+        )
+    else:
+        system_prompt = (
+            'Ты — помощник службы поддержки, который делает краткое, но информативное summary тикета.\n'
+            'Сделай 2–4 предложения, которые:\n'
+            '1) Кратко опишут проблему пользователя.\n'
+            '2) Покажут, что уже сделано (действия пользователя или ИИ).\n'
+            '3) При необходимости укажут следующий шаг для оператора.\n'
+            'Пиши на русском, без воды, чтобы оператор быстро понял суть без чтения всей переписки.'
+        )
+
+        user_prompt = (
+            'Текст пользователя:\n'
+            f'{user_text or "—"}\n\n'
+            'Ответ ИИ (если есть):\n'
+            f'{ai_answer or "—"}\n\n'
+            'Сделай, пожалуйста, summary по правилам выше.'
+        )
+
+    try:
+        completion = openai_client.chat.completions.create(
+            model='gpt-4o-mini',
+            messages=[
+                {
+                    'role': 'system',
+                    'content': [{'type': 'text', 'text': system_prompt}],
+                },
+                {
+                    'role': 'user',
+                    'content': [{'type': 'text', 'text': user_prompt}],
+                },
+            ],
+            temperature=0.2,
+        )
+        long_summary = completion.choices[0].message.content or ''
+        return jsonify({'summary': long_summary.strip()})
+    except Exception as e:
+        print(f'[summarize] OpenAI error: {e}', file=sys.stderr)
+        fallback = existing_summary or build_summary_ru('Другое', base_text)
+        return jsonify({'summary': fallback})
+
+
+@app.route('/tickets/<ticket_id>/resolve', methods=['POST'])
+def resolve_ticket(ticket_id):
+    """
+    Пометка тикета как auto-resolved (подтверждение пользователем).
+    """
+    tickets = load_tickets()
+    if not tickets:
+        return jsonify({'message': 'Нет тикетов'}), 404
+
+    normalized = ticket_id if ticket_id.startswith('#') else f'#{ticket_id}'
+    updated_ticket = None
+
+    for t in tickets:
+        if t.get('id') == normalized:
+            t['status'] = 'auto-resolved'
+            t['auto_resolve'] = True
+            updated_ticket = t
+            break
+
+    if updated_ticket is None:
+        return jsonify({'message': 'Тикет не найден', 'ticket_id': normalized}), 404
+
+    save_tickets(tickets)
+    return jsonify(updated_ticket), 200
+
+@app.route('/register', methods=['POST'])
+def register():
+    """
+    Простая регистрация по email + паролю.
+
+    Ожидает JSON: { "email": "...", "password": "..." }
+    """
+    data = request.get_json() or {}
+    email = (data.get('email') or data.get('username') or '').strip().lower()
+    password = data.get('password') or ''
+
+    if not email or not password:
+        return jsonify({'message': 'Укажите email и пароль'}), 400
+
+    users = load_users()
+    if any((u.get('email') or u.get('username', '')).lower() == email for u in users):
+        return jsonify({'message': 'Пользователь с таким email уже существует'}), 409
+
+    users.append({'email': email, 'password': password})
+    save_users(users)
+    return jsonify({'message': 'Регистрация прошла успешно', 'email': email}), 201
 
 
 @app.route('/login', methods=['POST'])
 def login():
-    data = request.get_json()
-    username = data.get('username')
-    password = data.get('password')
+    """
+    Простой логин по email + паролю.
+
+    Ожидает JSON: { "email": "...", "password": "..." }
+    """
+    data = request.get_json() or {}
+    email = (data.get('email') or data.get('username') or '').strip().lower()
+    password = data.get('password') or ''
+
     users = load_users()
     for user in users:
-        if user['username'] == username and user['password'] == password:
-            return jsonify({'message': 'Успешно авторизировались'}), 200
-    return jsonify({'message': 'Не правильный логин или пароль'}), 401
+        stored_email = (user.get('email') or user.get('username', '')).lower()
+        if stored_email == email and user.get('password') == password:
+            return jsonify({'message': 'Успешно авторизировались', 'email': email}), 200
+    return jsonify({'message': 'Неправильный email или пароль'}), 401
 
 
 if __name__ == '__main__':

@@ -11,6 +11,14 @@ type ScreenId =
 type Priority = 'low' | 'medium' | 'high'
 type Status = 'new' | 'in-progress' | 'auto-resolved' | 'assigned' | 'closed'
 
+type ChatRole = 'user' | 'assistant'
+
+interface ChatMessage {
+  id: number
+  role: ChatRole
+  text: string
+}
+
 interface TicketRow {
   id: string
   source: 'Web' | 'Email' | 'Phone'
@@ -25,9 +33,12 @@ interface TicketRow {
   answer?: string
   autoResolve?: boolean
   needHuman?: boolean
+  language?: 'ru' | 'kk'
+  history?: { role: ChatRole; text: string }[]
 }
 
 interface RouterResult {
+  ticket_id?: string
   category: string
   priority: Priority
   department: string
@@ -108,6 +119,12 @@ function statusChip(status: Status) {
 
 function App() {
   const [screen, setScreen] = useState<ScreenId>('submit')
+  const [currentUserEmail, setCurrentUserEmail] = useState<string | null>(null)
+  const [authEmail, setAuthEmail] = useState('')
+  const [authPassword, setAuthPassword] = useState('')
+  const [authMode, setAuthMode] = useState<'login' | 'register'>('login')
+  const [authIsLoading, setAuthIsLoading] = useState(false)
+  const [authError, setAuthError] = useState<string | null>(null)
   const [source, setSource] = useState<'Web' | 'Email' | 'Phone'>('Web')
   const [problem, setProblem] = useState('')
   const [ticketCreated, setTicketCreated] = useState(false)
@@ -119,6 +136,12 @@ function App() {
   const [metrics, setMetrics] = useState<Metrics | null>(null)
   const [metricsError, setMetricsError] = useState<string | null>(null)
   const [selectedTicket, setSelectedTicket] = useState<TicketRow | null>(null)
+  const [conversationInput, setConversationInput] = useState('')
+  const [conversationIsLoading, setConversationIsLoading] = useState(false)
+  const [conversationError, setConversationError] = useState<string | null>(null)
+  const [conversationMessages, setConversationMessages] = useState<ChatMessage[]>([])
+  const [inlineSummary, setInlineSummary] = useState<string | null>(null)
+  const [isClosingTicket, setIsClosingTicket] = useState(false)
 
   // Load tickets when entering operator view
   useEffect(() => {
@@ -127,7 +150,11 @@ function App() {
     const load = async () => {
       try {
         setTicketsError(null)
-        const response = await fetch('http://127.0.0.1:5000/tickets')
+        const url =
+          currentUserEmail != null && currentUserEmail.trim() !== ''
+            ? `http://127.0.0.1:5000/tickets?email=${encodeURIComponent(currentUserEmail)}`
+            : 'http://127.0.0.1:5000/tickets'
+        const response = await fetch(url)
         if (!response.ok) throw new Error(`Backend error: ${response.status}`)
         const data = (await response.json()) as any[]
 
@@ -145,6 +172,13 @@ function App() {
           answer: t.answer,
           autoResolve: t.auto_resolve,
           needHuman: t.need_human,
+          language: t.language as 'ru' | 'kk' | undefined,
+          history: Array.isArray(t.history)
+            ? (t.history as any[]).map((m) => ({
+                role: (m.role === 'assistant' ? 'assistant' : 'user') as ChatRole,
+                text: (m.text ?? m.content ?? '') as string,
+              }))
+            : undefined,
         }))
 
         if (mapped.length) {
@@ -160,7 +194,19 @@ function App() {
     }
 
     void load()
-  }, [screen])
+  }, [screen, currentUserEmail])
+
+  // Если пользователь не авторизован, не даём находиться на защищённых экранах
+  useEffect(() => {
+    if (!currentUserEmail && screen !== 'submit') {
+      setScreen('submit')
+    }
+  }, [currentUserEmail, screen])
+
+  // Сброс локального summary при смене тикета или экрана
+  useEffect(() => {
+    setInlineSummary(null)
+  }, [selectedTicket, screen])
 
   // Load metrics when entering dashboard view
   useEffect(() => {
@@ -210,7 +256,22 @@ function App() {
               className={`app-nav-button ${
                 screen === 'conversation' ? 'app-nav-button--active' : ''
               }`}
-              onClick={() => setScreen('conversation')}
+              onClick={() => {
+                if (!currentUserEmail) {
+                  window.alert(
+                    'Чтобы открыть диалог, сначала войдите или зарегистрируйтесь по email на вкладке «Пользователь».',
+                  )
+                  return
+                }
+                // При явном переходе на вкладку "Диалог" сбрасываем выбранный тикет,
+                // чтобы не "залипать" в режиме просмотра конкретного тикета.
+                setSelectedTicket(null)
+                setConversationMessages([])
+                setConversationInput('')
+                setConversationError(null)
+                setInlineSummary(null)
+                setScreen('conversation')
+              }}
             >
               Диалог
               <span>Ticket thread</span>
@@ -220,7 +281,15 @@ function App() {
               className={`app-nav-button ${
                 screen === 'operator' ? 'app-nav-button--active' : ''
               }`}
-              onClick={() => setScreen('operator')}
+              onClick={() => {
+                if (!currentUserEmail) {
+                  window.alert(
+                    'Чтобы открыть список тикетов, сначала войдите или зарегистрируйтесь по email на вкладке «Пользователь».',
+                  )
+                  return
+                }
+                setScreen('operator')
+              }}
             >
               Оператор
               <span>Tickets</span>
@@ -230,7 +299,15 @@ function App() {
               className={`app-nav-button ${
                 screen === 'dashboard' ? 'app-nav-button--active' : ''
               }`}
-              onClick={() => setScreen('dashboard')}
+              onClick={() => {
+                if (!currentUserEmail) {
+                  window.alert(
+                    'Чтобы открыть дашборд, сначала войдите или зарегистрируйтесь по email на вкладке «Пользователь».',
+                  )
+                  return
+                }
+                setScreen('dashboard')
+              }}
             >
               Дашборд
               <span>Admin</span>
@@ -240,7 +317,15 @@ function App() {
               className={`app-nav-button ${
                 screen === 'email-demo' ? 'app-nav-button--active' : ''
               }`}
-              onClick={() => setScreen('email-demo')}
+              onClick={() => {
+                if (!currentUserEmail) {
+                  window.alert(
+                    'Чтобы открыть email demo, сначала войдите или зарегистрируйтесь по email на вкладке «Пользователь».',
+                  )
+                  return
+                }
+                setScreen('email-demo')
+              }}
             >
               Email demo
               <span>Integration</span>
@@ -248,8 +333,12 @@ function App() {
           </nav>
 
           <div className="app-user-chip">
-            <div className="app-user-avatar">AO</div>
-            <div className="app-user-name">Operator</div>
+            <div className="app-user-avatar">
+              {currentUserEmail ? currentUserEmail[0].toUpperCase() : 'G'}
+            </div>
+            <div className="app-user-name">
+              {currentUserEmail || 'Гость'}
+            </div>
           </div>
         </div>
       </header>
@@ -272,6 +361,179 @@ function App() {
               </div>
             </div>
 
+            {/* Блок авторизации по email */}
+            <div className="card" style={{ marginBottom: 16 }}>
+              <div className="card-header">
+                <div>
+                  <div className="card-title">
+                    {currentUserEmail ? 'Вы вошли в систему' : 'Вход / Регистрация'}
+                  </div>
+                  <div className="card-subtitle">
+                    Тикеты и диалоги будут сохраняться отдельно для каждого email.
+                  </div>
+                </div>
+              </div>
+
+              <div
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 10,
+                  maxWidth: 360,
+                }}
+              >
+                <input
+                  className="input"
+                  type="email"
+                  placeholder="your.email@example.com"
+                  value={authEmail}
+                  onChange={(e) => setAuthEmail(e.target.value)}
+                />
+                <input
+                  className="input"
+                  type="password"
+                  placeholder="Пароль"
+                  value={authPassword}
+                  onChange={(e) => setAuthPassword(e.target.value)}
+                />
+                {authError && (
+                  <div
+                    className="text-xs"
+                    style={{ color: '#b91c1c', marginTop: 2 }}
+                  >
+                    {authError}
+                  </div>
+                )}
+                <div
+                  style={{
+                    display: 'flex',
+                    gap: 8,
+                    alignItems: 'center',
+                    flexWrap: 'wrap',
+                  }}
+                >
+                  <button
+                    type="button"
+                    className="button button-small"
+                    onClick={async () => {
+                      const email = authEmail.trim().toLowerCase()
+                      if (!email || !authPassword) {
+                        setAuthError('Введите email и пароль.')
+                        return
+                      }
+                      setAuthError(null)
+                      setAuthIsLoading(true)
+                      setAuthMode('login')
+                      try {
+                        const response = await fetch(
+                          'http://127.0.0.1:5000/login',
+                          {
+                            method: 'POST',
+                            headers: {
+                              'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify({
+                              email,
+                              password: authPassword,
+                            }),
+                          },
+                        )
+                        if (!response.ok) {
+                          const data = (await response.json().catch(() => ({}))) as {
+                            message?: string
+                          }
+                          throw new Error(
+                            data.message || `Ошибка входа: ${response.status}`,
+                          )
+                        }
+                        setCurrentUserEmail(email)
+                      } catch (err) {
+                        console.error(err)
+                        setAuthError(
+                          err instanceof Error
+                            ? err.message
+                            : 'Не удалось выполнить вход.',
+                        )
+                      } finally {
+                        setAuthIsLoading(false)
+                      }
+                    }}
+                  >
+                    {authIsLoading && authMode === 'login' ? 'Вход...' : 'Войти'}
+                  </button>
+                  <button
+                    type="button"
+                    className="button button-secondary button-small"
+                    onClick={async () => {
+                      const email = authEmail.trim().toLowerCase()
+                      if (!email || !authPassword) {
+                        setAuthError('Введите email и пароль.')
+                        return
+                      }
+                      setAuthError(null)
+                      setAuthIsLoading(true)
+                      setAuthMode('register')
+                      try {
+                        const response = await fetch(
+                          'http://127.0.0.1:5000/register',
+                          {
+                            method: 'POST',
+                            headers: {
+                              'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify({
+                              email,
+                              password: authPassword,
+                            }),
+                          },
+                        )
+                        if (!response.ok) {
+                          const data = (await response.json().catch(() => ({}))) as {
+                            message?: string
+                          }
+                          throw new Error(
+                            data.message ||
+                              `Ошибка регистрации: ${response.status}`,
+                          )
+                        }
+                        setCurrentUserEmail(email)
+                      } catch (err) {
+                        console.error(err)
+                        setAuthError(
+                          err instanceof Error
+                            ? err.message
+                            : 'Не удалось выполнить регистрацию.',
+                        )
+                      } finally {
+                        setAuthIsLoading(false)
+                      }
+                    }}
+                  >
+                    {authIsLoading && authMode === 'register'
+                      ? 'Регистрация...'
+                      : 'Зарегистрироваться'}
+                  </button>
+                  {currentUserEmail && (
+                    <button
+                      type="button"
+                      className="button button-ghost button-small"
+                      onClick={() => {
+                        setCurrentUserEmail(null)
+                      }}
+                    >
+                      Выйти
+                    </button>
+                  )}
+                </div>
+                {currentUserEmail && (
+                  <div className="text-xs text-soft">
+                    Вы вошли как <span className="text-strong">{currentUserEmail}</span>.
+                    Все новые тикеты и эскалации будут привязаны к этому email.
+                  </div>
+                )}
+              </div>
+            </div>
+
             <div className="layout-split">
               <div className="card">
                 <div className="card-header">
@@ -288,6 +550,13 @@ function App() {
                     event.preventDefault()
                     if (!problem.trim()) {
                       setError('Пожалуйста, опишите проблему перед отправкой.')
+                      return
+                    }
+
+                    if (!currentUserEmail) {
+                      setError(
+                        'Чтобы отправить заявку, сначала войдите или зарегистрируйтесь по email выше.',
+                      )
                       return
                     }
 
@@ -312,6 +581,7 @@ function App() {
                           input: {
                             text: problem,
                             source: backendSource,
+                            user_email: currentUserEmail,
                           },
                         }),
                       })
@@ -411,7 +681,9 @@ function App() {
 
                 <div className="chat-shell">
                   <div className="chat-meta-strip">
-                    <div className="chat-meta-main">Ticket #1234</div>
+                    <div className="chat-meta-main">
+                      {routerResult?.ticket_id || 'Ticket #1234'}
+                    </div>
                     <div className="chat-meta-divider" />
                     <div className="chip">
                       Category:{' '}
@@ -460,6 +732,58 @@ function App() {
                             </div>
                           </div>
                         )}
+                        <div
+                          style={{
+                            marginTop: 8,
+                            display: 'flex',
+                            justifyContent: 'flex-end',
+                          }}
+                        >
+                          <button
+                            type="button"
+                            className="button button-secondary button-small"
+                            onClick={async () => {
+                              if (!routerResult?.ticket_id) {
+                                window.alert(
+                                  'Сначала отправьте заявку, чтобы появился тикет.',
+                                )
+                                return
+                              }
+                              try {
+                                const idForApi = encodeURIComponent(
+                                  routerResult.ticket_id,
+                                )
+                                const response = await fetch(
+                                  `http://127.0.0.1:5000/tickets/${idForApi}/resolve`,
+                                  {
+                                    method: 'POST',
+                                  },
+                                )
+                                if (!response.ok) {
+                                  throw new Error(
+                                    `Backend error: ${response.status}`,
+                                  )
+                                }
+                                setTicketCreated(false)
+                                setRouterResult((prev) =>
+                                  prev
+                                    ? { ...prev, auto_resolve: true }
+                                    : prev,
+                                )
+                                setError(
+                                  'Спасибо, что подтвердили решение. Тикет помечен как auto-resolved.',
+                                )
+                              } catch (err) {
+                                console.error(err)
+                                setError(
+                                  'Не удалось пометить тикет как решённый. Попробуйте позже.',
+                                )
+                              }
+                            }}
+                          >
+                            Проблема решена
+                          </button>
+                        </div>
                       </>
                     ) : (
                       <div className="chat-message chat-message--right">
@@ -488,6 +812,10 @@ function App() {
                 <p className="page-subtitle">
                   Полный контекст общения: пользователь, ИИ и оператор в одной
                   чёткой ленте.
+                </p>
+                <p className="page-subtitle">
+                  Нажмите заново на страницу &laquo;Диалог&raquo;, чтобы открыть новый
+                  чат.
                 </p>
               </div>
               <div className="badge-soft">
@@ -539,27 +867,72 @@ function App() {
                   </div>
                 </div>
 
+                <div
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'flex-end',
+                    marginBottom: 8,
+                  }}
+                >
+                  <button
+                    type="button"
+                    className="button button-secondary button-small"
+                    onClick={() => {
+                      // Полный сброс текущего диалога и возврат к новому чату
+                      setSelectedTicket(null)
+                      setConversationMessages([])
+                      setConversationInput('')
+                      setConversationError(null)
+                      setInlineSummary(null)
+                    }}
+                  >
+                    Начать новый диалог
+                  </button>
+                </div>
+
                 <div className="chat-shell">
                   <div className="chat-stream">
                     {selectedTicket ? (
                       <>
-                        <div className="chat-message chat-message--left">
-                          <div className="chat-message-meta">
-                            Пользователь · последнее сообщение
+                        {(selectedTicket.history && selectedTicket.history.length
+                          ? selectedTicket.history
+                          : [
+                              { role: 'user' as ChatRole, text: selectedTicket.lastText || '' },
+                              {
+                                role: 'assistant' as ChatRole,
+                                text:
+                                  selectedTicket.answer ||
+                                  'Ответ модели по этому тикету будет отображаться здесь.',
+                              },
+                            ]
+                        ).map((msg, index) => (
+                          <div
+                            key={index}
+                            className={`chat-message ${
+                              msg.role === 'user'
+                                ? 'chat-message--left'
+                                : 'chat-message--right'
+                            }`}
+                          >
+                            <div className="chat-message-meta">
+                              {msg.role === 'user'
+                                ? 'Пользователь'
+                                : 'HelpDesk AI · ответ'}
+                            </div>
+                            <div
+                              className={`chat-message-body ${
+                                msg.role === 'user'
+                                  ? 'chat-bubble-user'
+                                  : 'chat-bubble-ai'
+                              }`}
+                            >
+                              {msg.text ||
+                                (msg.role === 'user'
+                                  ? 'Текст обращения пользователя будет отображаться здесь.'
+                                  : 'Ответ модели по этому тикету будет отображаться здесь.')}
+                            </div>
                           </div>
-                          <div className="chat-message-body chat-bubble-user">
-                            {selectedTicket.lastText ||
-                              'Текст последнего обращения пользователя будет отображаться здесь.'}
-                          </div>
-                        </div>
-
-                        <div className="chat-message chat-message--right">
-                          <div className="chat-message-meta">HelpDesk AI · ответ</div>
-                          <div className="chat-message-body chat-bubble-ai">
-                            {selectedTicket.answer ||
-                              'Ответ модели по этому тикету будет отображаться здесь.'}
-                          </div>
-                        </div>
+                        ))}
 
                         <div className="chat-note">
                           <div className="chat-note-bubble">
@@ -572,71 +945,103 @@ function App() {
                         </div>
                       </>
                     ) : (
-                      <>
-                        <div className="chat-message chat-message--left">
-                          <div className="chat-message-meta">
-                            Пользователь · 10:24
-                          </div>
-                          <div className="chat-message-body chat-bubble-user">
-                            Не получается войти в аккаунт, пробовал уже несколько
-                            раз.
-                          </div>
-                        </div>
-
-                        <div className="chat-message chat-message--right">
-                          <div className="chat-message-meta">HelpDesk AI · 10:24</div>
-                          <div className="chat-message-body chat-bubble-ai">
-                            Проверил последние попытки авторизации — вижу несколько
-                            неуспешных входов с ошибкой «неверный пароль». Я могу:
-                            <ul style={{ margin: '6px 0 0 18px' }}>
-                              <li>
-                                отправить вам безопасную ссылку для сброса пароля;
-                              </li>
-                              <li>
-                                очистить активные сессии на других устройствах;
-                              </li>
-                            </ul>
-                            <div style={{ marginTop: 8, fontSize: 12 }}>
-                              Ответьте «Да», чтобы продолжить автоматически.
+                      conversationMessages.length ? (
+                        conversationMessages.map((msg) => (
+                          <div
+                            key={msg.id}
+                            className={`chat-message ${
+                              msg.role === 'user'
+                                ? 'chat-message--left'
+                                : 'chat-message--right'
+                            }`}
+                          >
+                            <div className="chat-message-meta">
+                              {msg.role === 'user'
+                                ? 'Вы · сообщение'
+                                : 'HelpDesk AI · live'}
+                            </div>
+                            <div
+                              className={`chat-message-body ${
+                                msg.role === 'user'
+                                  ? 'chat-bubble-user'
+                                  : 'chat-bubble-ai'
+                              }`}
+                            >
+                              {msg.text}
                             </div>
                           </div>
-                        </div>
-
-                        <div className="chat-message chat-message--left">
-                          <div className="chat-message-meta">
-                            Пользователь · 10:25
-                          </div>
-                          <div className="chat-message-body chat-bubble-user">
-                            Да, давайте сбросим пароль.
-                          </div>
-                        </div>
-
-                        <div className="chat-message chat-message--right">
-                          <div className="chat-message-meta">HelpDesk AI · 10:25</div>
-                          <div className="chat-message-body chat-bubble-ai">
-                            Я отправил вам письмо с ссылкой для сброса пароля. Срок
-                            действия: 30 минут.
-                          </div>
-                        </div>
-
-                        <div className="chat-message chat-message--right">
-                          <div className="chat-message-meta">Operator · 10:26</div>
-                          <div className="chat-message-body chat-bubble-operator">
-                            Если ссылка не придёт в течение 5 минут, пожалуйста,
-                            проверьте папку «Спам» или напишите сюда ещё раз.
-                          </div>
-                        </div>
-
-                        <div className="chat-note">
-                          <div className="chat-note-bubble">
-                            <div className="chat-note-tag">internal</div>
-                            <div className="text-xs">
-                              Пользователь часто забывает пароль, можно предложить
-                              включить вход по biometrics в следующей версии.
+                        ))
+                      ) : (
+                        <>
+                          <div className="chat-message chat-message--left">
+                            <div className="chat-message-meta">
+                              Пользователь · 10:24
+                            </div>
+                            <div className="chat-message-body chat-bubble-user">
+                              Не получается войти в аккаунт, пробовал уже несколько
+                              раз.
                             </div>
                           </div>
-                        </div>
-                      </>
+
+                          <div className="chat-message chat-message--right">
+                            <div className="chat-message-meta">
+                              HelpDesk AI · 10:24
+                            </div>
+                            <div className="chat-message-body chat-bubble-ai">
+                              Проверил последние попытки авторизации — вижу несколько
+                              неуспешных входов с ошибкой «неверный пароль». Я могу:
+                              <ul style={{ margin: '6px 0 0 18px' }}>
+                                <li>
+                                  отправить вам безопасную ссылку для сброса пароля;
+                                </li>
+                                <li>
+                                  очистить активные сессии на других устройствах;
+                                </li>
+                              </ul>
+                              <div style={{ marginTop: 8, fontSize: 12 }}>
+                                Ответьте «Да», чтобы продолжить автоматически.
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="chat-message chat-message--left">
+                            <div className="chat-message-meta">
+                              Пользователь · 10:25
+                            </div>
+                            <div className="chat-message-body chat-bubble-user">
+                              Да, давайте сбросим пароль.
+                            </div>
+                          </div>
+
+                          <div className="chat-message chat-message--right">
+                            <div className="chat-message-meta">
+                              HelpDesk AI · 10:25
+                            </div>
+                            <div className="chat-message-body chat-bubble-ai">
+                              Я отправил вам письмо с ссылкой для сброса пароля. Срок
+                              действия: 30 минут.
+                            </div>
+                          </div>
+
+                          <div className="chat-message chat-message--right">
+                            <div className="chat-message-meta">Operator · 10:26</div>
+                            <div className="chat-message-body chat-bubble-operator">
+                              Если ссылка не придёт в течение 5 минут, пожалуйста,
+                              проверьте папку «Спам» или напишите сюда ещё раз.
+                            </div>
+                          </div>
+
+                          <div className="chat-note">
+                            <div className="chat-note-bubble">
+                              <div className="chat-note-tag">internal</div>
+                              <div className="text-xs">
+                                Пользователь часто забывает пароль, можно предложить
+                                включить вход по biometrics в следующей версии.
+                              </div>
+                            </div>
+                          </div>
+                        </>
+                      )
                     )}
                   </div>
 
@@ -645,37 +1050,396 @@ function App() {
                       <textarea
                         className="chat-input"
                         placeholder="Написать сообщение"
+                        value={conversationInput}
+                        onChange={(event) =>
+                          setConversationInput(event.target.value)
+                        }
                       />
-                      <button type="button" className="button button-small">
-                        Отправить
+                      <button
+                        type="button"
+                        className="button button-small"
+                        onClick={async () => {
+                          const text = conversationInput.trim()
+                          if (!text) {
+                            setConversationError(
+                              'Введите текст сообщения перед отправкой.',
+                            )
+                            return
+                          }
+
+                          if (!currentUserEmail) {
+                            setConversationError(
+                              'Чтобы писать в чат с ИИ, сначала войдите или зарегистрируйтесь по email на вкладке «Пользователь».',
+                            )
+                            return
+                          }
+
+                          setConversationError(null)
+                          setConversationIsLoading(true)
+
+                          const newUserMessage: ChatMessage = {
+                            id: Date.now(),
+                            role: 'user',
+                            text,
+                          }
+
+                          const historyToSend = [
+                            ...conversationMessages,
+                            newUserMessage,
+                          ].map((msg) => ({
+                            role: msg.role,
+                            content: msg.text,
+                          }))
+
+                          setConversationMessages((prev) => [
+                            ...prev,
+                            newUserMessage,
+                          ])
+
+                          try {
+                            const response = await fetch(
+                              'http://127.0.0.1:5000/ask',
+                              {
+                                method: 'POST',
+                                headers: {
+                                  'Content-Type': 'application/json',
+                                },
+                                body: JSON.stringify({
+                                  text,
+                                  history: historyToSend,
+                                  email: currentUserEmail,
+                                }),
+                              },
+                            )
+
+                            if (!response.ok) {
+                              throw new Error(
+                                `Backend error: ${response.status}`,
+                              )
+                            }
+
+                            const data = (await response.json()) as {
+                              reply?: string
+                            }
+                            const aiText = data.reply ?? ''
+                            const aiMessage: ChatMessage = {
+                              id: Date.now() + 1,
+                              role: 'assistant',
+                              text: aiText,
+                            }
+                            setConversationMessages((prev) => [...prev, aiMessage])
+                          } catch (err) {
+                            console.error(err)
+                            setConversationError(
+                              'Не удалось получить ответ от бэкенда. Проверьте, что backend запущен на :5000.',
+                            )
+                          } finally {
+                            setConversationIsLoading(false)
+                            setConversationInput('')
+                          }
+                        }}
+                      >
+                        {conversationIsLoading ? 'Отправка…' : 'Отправить'}
                       </button>
                     </div>
+                    {conversationError && (
+                      <div
+                        className="text-xs"
+                        style={{ color: '#b91c1c', marginTop: 4 }}
+                      >
+                        {conversationError}
+                      </div>
+                    )}
                     <div className="chat-actions chat-actions-right">
                       <button
                         type="button"
                         className="button button-secondary button-small"
+                        onClick={async () => {
+                          if (!selectedTicket) {
+                            window.alert(
+                              'Сначала откройте тикет через страницу «Оператор», чтобы сделать summary.',
+                            )
+                            return
+                          }
+                          try {
+                            setConversationError(null)
+                            const response = await fetch(
+                              'http://127.0.0.1:5000/summarize',
+                              {
+                                method: 'POST',
+                                headers: {
+                                  'Content-Type': 'application/json',
+                                },
+                                body: JSON.stringify({
+                                  user_text: selectedTicket.lastText || '',
+                                  ai_answer: selectedTicket.answer || '',
+                                  summary: selectedTicket.summary || '',
+                                }),
+                              },
+                            )
+                            if (!response.ok) {
+                              throw new Error(
+                                `Backend error: ${response.status}`,
+                              )
+                            }
+                            const data = (await response.json()) as {
+                              summary?: string
+                            }
+                            setInlineSummary(
+                              data.summary ||
+                                selectedTicket.summary ||
+                                'Для этого тикета пока нет готового summary от модели.',
+                            )
+                          } catch (err) {
+                            console.error(err)
+                            setConversationError(
+                              'Не удалось построить summary. Проверьте backend или попробуйте позже.',
+                            )
+                          }
+                        }}
                       >
                         Сделать summary
                       </button>
                       <button
                         type="button"
                         className="button button-secondary button-small"
+                        onClick={async () => {
+                          if (!selectedTicket) {
+                            window.alert(
+                              'Чтобы перевести диалог, сначала откройте тикет через страницу «Оператор».',
+                            )
+                            return
+                          }
+                          try {
+                            setConversationError(null)
+                            const response = await fetch(
+                              'http://127.0.0.1:5000/translate',
+                              {
+                                method: 'POST',
+                                headers: {
+                                  'Content-Type': 'application/json',
+                                },
+                                body: JSON.stringify({
+                                  target_language: 'ru',
+                                  user_text: selectedTicket.lastText || '',
+                                  ai_answer: selectedTicket.answer || '',
+                                  summary: selectedTicket.summary || '',
+                                }),
+                              },
+                            )
+                            if (!response.ok) {
+                              throw new Error(
+                                `Backend error: ${response.status}`,
+                              )
+                            }
+                            const data = (await response.json()) as {
+                              user_text?: string
+                              ai_answer?: string
+                              summary?: string
+                            }
+                            const updated: TicketRow = {
+                              ...selectedTicket,
+                              lastText: data.user_text ?? selectedTicket.lastText,
+                              answer: data.ai_answer ?? selectedTicket.answer,
+                              summary: data.summary ?? selectedTicket.summary,
+                            }
+                            setSelectedTicket(updated)
+                            setTickets((prev) =>
+                              prev.map((t) => (t.id === updated.id ? updated : t)),
+                            )
+                            // После перевода просим ИИ заново сделать summary на русском
+                            try {
+                              const sumResponse = await fetch(
+                                'http://127.0.0.1:5000/summarize',
+                                {
+                                  method: 'POST',
+                                  headers: {
+                                    'Content-Type': 'application/json',
+                                  },
+                                  body: JSON.stringify({
+                                    user_text: updated.lastText || '',
+                                    ai_answer: updated.answer || '',
+                                    summary: updated.summary || '',
+                                    language: 'ru',
+                                  }),
+                                },
+                              )
+                              if (sumResponse.ok) {
+                                const sumData = (await sumResponse.json()) as {
+                                  summary?: string
+                                }
+                                setInlineSummary(
+                                  sumData.summary ||
+                                    updated.summary ||
+                                    inlineSummary ||
+                                    null,
+                                )
+                              } else {
+                                setInlineSummary(updated.summary ?? inlineSummary ?? null)
+                              }
+                            } catch {
+                              setInlineSummary(updated.summary ?? inlineSummary ?? null)
+                            }
+                          } catch (err) {
+                            console.error(err)
+                            setConversationError(
+                              'Не удалось перевести диалог на русский. Проверьте backend или попробуйте позже.',
+                            )
+                          }
+                        }}
                       >
                         Перевести на русский
                       </button>
                       <button
                         type="button"
                         className="button button-secondary button-small"
+                        onClick={async () => {
+                          if (!selectedTicket) {
+                            window.alert(
+                              'Чтобы перевести диалог, сначала откройте тикет через страницу «Оператор».',
+                            )
+                            return
+                          }
+                          try {
+                            setConversationError(null)
+                            const response = await fetch(
+                              'http://127.0.0.1:5000/translate',
+                              {
+                                method: 'POST',
+                                headers: {
+                                  'Content-Type': 'application/json',
+                                },
+                                body: JSON.stringify({
+                                  target_language: 'kk',
+                                  user_text: selectedTicket.lastText || '',
+                                  ai_answer: selectedTicket.answer || '',
+                                  summary: selectedTicket.summary || '',
+                                }),
+                              },
+                            )
+                            if (!response.ok) {
+                              throw new Error(
+                                `Backend error: ${response.status}`,
+                              )
+                            }
+                            const data = (await response.json()) as {
+                              user_text?: string
+                              ai_answer?: string
+                              summary?: string
+                            }
+                            const updated: TicketRow = {
+                              ...selectedTicket,
+                              lastText: data.user_text ?? selectedTicket.lastText,
+                              answer: data.ai_answer ?? selectedTicket.answer,
+                              summary: data.summary ?? selectedTicket.summary,
+                            }
+                            setSelectedTicket(updated)
+                            setTickets((prev) =>
+                              prev.map((t) => (t.id === updated.id ? updated : t)),
+                            )
+                            // После перевода просим ИИ заново сделать summary на казахском
+                            try {
+                              const sumResponse = await fetch(
+                                'http://127.0.0.1:5000/summarize',
+                                {
+                                  method: 'POST',
+                                  headers: {
+                                    'Content-Type': 'application/json',
+                                  },
+                                  body: JSON.stringify({
+                                    user_text: updated.lastText || '',
+                                    ai_answer: updated.answer || '',
+                                    summary: updated.summary || '',
+                                    language: 'kk',
+                                  }),
+                                },
+                              )
+                              if (sumResponse.ok) {
+                                const sumData = (await sumResponse.json()) as {
+                                  summary?: string
+                                }
+                                setInlineSummary(
+                                  sumData.summary ||
+                                    updated.summary ||
+                                    inlineSummary ||
+                                    null,
+                                )
+                              } else {
+                                setInlineSummary(updated.summary ?? inlineSummary ?? null)
+                              }
+                            } catch {
+                              setInlineSummary(updated.summary ?? inlineSummary ?? null)
+                            }
+                          } catch (err) {
+                            console.error(err)
+                            setConversationError(
+                              'Не удалось перевести диалог на казахский. Проверьте backend или попробуйте позже.',
+                            )
+                          }
+                        }}
                       >
                         Перевести на казахский
                       </button>
                       <button
                         type="button"
                         className="button button-danger button-small"
+                        onClick={async () => {
+                          if (!selectedTicket) {
+                            window.alert(
+                              'Чтобы закрыть тикет, сначала откройте его через страницу «Оператор».',
+                            )
+                            return
+                          }
+                          if (
+                            !window.confirm(
+                              `Вы уверены, что хотите закрыть и удалить тикет ${selectedTicket.id}?`,
+                            )
+                          ) {
+                            return
+                          }
+                          try {
+                            setConversationError(null)
+                            setIsClosingTicket(true)
+                            const idForApi = encodeURIComponent(selectedTicket.id)
+                            const response = await fetch(
+                              `http://127.0.0.1:5000/tickets/${idForApi}`,
+                              {
+                                method: 'DELETE',
+                              },
+                            )
+                            if (!response.ok) {
+                              throw new Error(
+                                `Backend error: ${response.status}`,
+                              )
+                            }
+                            setTickets((prev) =>
+                              prev.filter((t) => t.id !== selectedTicket.id),
+                            )
+                            setSelectedTicket(null)
+                            setInlineSummary(null)
+                            setScreen('operator')
+                          } catch (err) {
+                            console.error(err)
+                            setConversationError(
+                              'Не удалось закрыть тикет. Проверьте backend или попробуйте позже.',
+                            )
+                          } finally {
+                            setIsClosingTicket(false)
+                          }
+                        }}
                       >
-                        Закрыть тикет
+                        {isClosingTicket ? 'Закрываем...' : 'Закрыть тикет'}
                       </button>
                     </div>
+                    {inlineSummary && (
+                      <div
+                        className="text-xs text-soft"
+                        style={{ marginTop: 6, maxWidth: 480 }}
+                      >
+                        <span className="text-strong">Summary: </span>
+                        {inlineSummary}
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>
@@ -1000,21 +1764,41 @@ function App() {
 
                 <div className="card-section">
                   <div className="chart-pie">
-                    <div className="chart-pie-visual" aria-hidden="true" />
+                    <div
+                      className="chart-pie-visual"
+                      aria-hidden="true"
+                      style={
+                        metrics
+                          ? {
+                              background: `conic-gradient(#6366f1 0 ${Math.max(
+                                0,
+                                Math.min(100, metrics.auto_resolved_pct),
+                              )}%, rgba(148, 163, 184, 0.9) ${Math.max(
+                                0,
+                                Math.min(100, metrics.auto_resolved_pct),
+                              )}% 100%)`,
+                            }
+                          : undefined
+                      }
+                    />
                     <div className="chart-pie-legend">
                       <div className="chart-pie-legend-item">
                         <span
                           className="chip-dot chip-dot--success"
                           aria-hidden="true"
                         />
-                        Auto-resolved · 64%
+                        Auto-resolved ·{' '}
+                        {metrics ? `${metrics.auto_resolved_pct}%` : '64%'}
                       </div>
                       <div className="chart-pie-legend-item">
                         <span
                           className="chip-dot chip-dot--muted"
                           aria-hidden="true"
                         />
-                        Human-resolved · 36%
+                        Human-resolved ·{' '}
+                        {metrics
+                          ? `${100 - Math.min(100, Math.max(0, metrics.auto_resolved_pct))}%`
+                          : '36%'}
                       </div>
                     </div>
                   </div>

@@ -738,12 +738,13 @@ button {
   flex: 1;
   border-radius: var(--radius-md);
   border: 1px solid transparent;
-  background: transparent;
+  background: #ffffff;
   resize: none;
   min-height: 44px;
   padding: 8px 10px;
   font-size: 14px;
   outline: none;
+  color: var(--color-text);
 }
 
 .chat-input::placeholder {
